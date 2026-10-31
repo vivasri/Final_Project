@@ -394,7 +394,9 @@ def get_agriculture_response(
     selected_district: Optional[str] = "Chennai",
     advisory: Optional[Dict[str, Any]] = None,
     telemetry: Optional[Dict[str, Any]] = None,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    *args,
+    **kwargs
 ) -> str:
     """
     Main entry point for chatbot responses.
@@ -455,7 +457,7 @@ def get_agriculture_response(
     # Multi-Intent: Weather + Paddy/Crop planting
     has_rain = any(w in q_cleaned for w in [
         "rain", "weather", "mazhai", "malai", "rainy", "tomorow", "tomorrow", "forecast",
-        "மழை", "வானிலை", "மழைய", "புயல்"
+        "மழை", "வானிலை", "மழைய", "புயல்", "பெய்யுமா", "பெய்யும்", "பெய்யாதா"
     ])
     has_paddy = any(w in q_cleaned for w in [
         "paddy", "rice", "nellu", "nel", "grow", "plant", "sow", "saagubadi", "cultivat",

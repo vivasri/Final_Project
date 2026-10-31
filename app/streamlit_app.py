@@ -21,6 +21,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import importlib
+import src.risk
+import src.advisory
+import src.chatbot
+import src.early_warning
+importlib.reload(src.chatbot)
+importlib.reload(src.early_warning)
+
 from src.risk import assess_district_hazards
 from src.advisory import get_adaptive_crop_advisory
 from src.chatbot import get_agriculture_response
