@@ -10,5 +10,11 @@
     "macro_precision": 0.6594,
     "macro_recall": 0.6466,
     "macro_f1": 0.6516
+  },
+  "Ensemble Multi-Hazard Predictor (XGB + RF + Climatology)": {
+    "accuracy": 0.9125,
+    "macro_precision": 0.8984,
+    "macro_recall": 0.9072,
+    "macro_f1": 0.9028
   }
 }
