@@ -1,0 +1,56 @@
+{
+  "train_samples": 540,
+  "val_samples": 120,
+  "test_samples": 240,
+  "train_date_range": [
+    "2018-07-01",
+    "2022-12-01"
+  ],
+  "val_date_range": [
+    "2023-01-01",
+    "2023-12-01"
+  ],
+  "test_date_range": [
+    "2024-01-01",
+    "2025-12-01"
+  ],
+  "risk_mapping": {
+    "Low": 0,
+    "Moderate": 1,
+    "High": 2,
+    "Severe": 3
+  },
+  "feature_cols": [
+    "enso_oni_lag1",
+    "enso_oni_lag2",
+    "enso_oni_lag3",
+    "enso_oni_lag4",
+    "enso_oni_lag5",
+    "enso_oni_lag6",
+    "iod_dmi_lag1",
+    "iod_dmi_lag2",
+    "iod_dmi_lag3",
+    "iod_dmi_lag4",
+    "iod_dmi_lag5",
+    "iod_dmi_lag6",
+    "enso_iod_lag1",
+    "rain_lag1",
+    "rain_cum_60d",
+    "rain_cum_90d",
+    "temp_lag1",
+    "soil_moisture_lag1",
+    "ndvi_lag1",
+    "humidity_lag1",
+    "sin_month",
+    "cos_month",
+    "is_nem",
+    "is_swm",
+    "elevation_m",
+    "slope_degree",
+    "drainage_distance_km",
+    "soil_ph",
+    "soil_clay_percent",
+    "soil_sand_percent",
+    "soil_nitrogen_mgkg"
+  ]
+}

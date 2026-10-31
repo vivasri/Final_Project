@@ -1,0 +1,14 @@
+{
+  "Random Forest Classifier": {
+    "accuracy": 0.7333,
+    "macro_precision": 0.6732,
+    "macro_recall": 0.6391,
+    "macro_f1": 0.6483
+  },
+  "XGBoost Classifier": {
+    "accuracy": 0.7208,
+    "macro_precision": 0.6594,
+    "macro_recall": 0.6466,
+    "macro_f1": 0.6516
+  }
+}
