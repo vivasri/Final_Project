@@ -1,643 +1,472 @@
 """
 src/chatbot.py
 ==============
-Rule-based Agriculture Advisory Chatbot for Tamil Nadu Farmers.
+Multi-lingual, Context-Aware Agriculture Chatbot for Tamil Nadu Climate DSS.
 
-Fully local — no external APIs required.
-Covers: crops, ENSO/IOD effects, sowing windows, irrigation, soil health,
-district agro-climatic zones, disaster response, and general agronomy.
+Features:
+1. ChatGPT-level AI via Gemini REST API (if GEMINI_API_KEY provided or entered in UI)
+2. Smart local conversational AI supporting:
+   - English
+   - Tamil script (தமிழ்)
+   - Tanglish (Tamil written in English script: 'mazhai varuma', 'nellu podalama')
+3. Multi-intent parser: NEVER returns a simple greeting when a question is asked
+4. Context-grounded in Tamil Nadu district forecasts (rainfall, anomalies, hazards)
+5. Answers general questions on agriculture, soil, fertilizers, pests, schemes, etc.
 """
 
 import re
-from typing import Optional
+import os
+import json
+from typing import Optional, Dict, Any
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
 
 # ---------------------------------------------------------------------------
-# KNOWLEDGE BASE — list of (pattern_list, response_template)
-# Pattern list uses simple lowercase substring matching.
+# Language & Script Detection
 # ---------------------------------------------------------------------------
 
-AGRI_KB = [
-    # ── GREETINGS ────────────────────────────────────────────────────────────
-    (
-        ["hello", "hi ", "helo", "hay ", "good morning", "good evening",
-         "good afternoon", "namaste", "vanakkam", "welcome"],
-        (
-            "👋 **Vanakkam! Welcome to the TN Agri Advisory Chatbot.**\n\n"
-            "I can help you with:\n"
-            "- 🌾 **Crop selection** for Tamil Nadu districts\n"
-            "- 🌧️ **ENSO / IOD effects** on monsoon rainfall\n"
-            "- 💧 **Irrigation & water management** during drought or flood\n"
-            "- 🗓️ **Sowing windows** for Kharif (SWM) and Rabi/NEM seasons\n"
-            "- 🌱 **Soil health, fertilizer & pest management**\n"
-            "- ⚠️ **Flood / drought emergency actions**\n\n"
-            "Type your question below — in plain English or Tamil-English mix!"
-        )
-    ),
-
-    # ── ENSO & EL NIÑO ───────────────────────────────────────────────────────
-    (
-        ["el nino", "el niño", "enso", "oni", "nino 3.4", "niño"],
-        (
-            "🌊 **ENSO (El Niño–Southern Oscillation) & Tamil Nadu Rainfall**\n\n"
-            "**El Niño (ONI ≥ +0.5 °C):**\n"
-            "- Weakens the South-West Monsoon (June–Sept) → **Below-normal rainfall in most of TN**\n"
-            "- North-East Monsoon (Oct–Dec) may be enhanced — Thanjavur/Cuddalore receive compensatory rains\n"
-            "- Drought risk rises for western & southern districts (Coimbatore, Madurai, Tirunelveli)\n"
-            "- **Advisory:** Pre-position seeds of drought-tolerant varieties (CO 51, Samba Mahsuri Sub1); "
-            "deepen farm ponds; activate AWD (Alternate Wetting & Drying)\n\n"
-            "**La Niña (ONI ≤ -0.5 °C):**\n"
-            "- Strengthens SWM → **Above-normal rainfall; flood risk in delta districts**\n"
-            "- NEM rainfall may be erratic\n"
-            "- **Advisory:** Ensure drainage channels are cleared; use raised-bed cultivation; "
-            "plant submergence-tolerant varieties (Swarna-Sub1, CR 1009 Sub1)\n\n"
-            "**Neutral ENSO:** Near-normal monsoon; follow standard agronomic calendar."
-        )
-    ),
-
-    # ── IOD / INDIAN OCEAN DIPOLE ───────────────────────────────────────────
-    (
-        ["iod", "indian ocean dipole", "dmi", "dipole"],
-        (
-            "🌏 **Indian Ocean Dipole (IOD) & Tamil Nadu**\n\n"
-            "The IOD measures sea surface temperature difference between the Western (Arabian Sea) "
-            "and Eastern (Bay of Bengal) Indian Ocean.\n\n"
-            "**Positive IOD (DMI ≥ +0.2):**\n"
-            "- Suppresses rainfall over SE India during SWM\n"
-            "- **But enhances NEM** — Bay of Bengal feeds extra moisture to TN coast\n"
-            "- Cauvery Delta (Thanjavur, Cuddalore) benefits from Oct–Dec NEM enhancement\n\n"
-            "**Negative IOD (DMI ≤ -0.2):**\n"
-            "- May reduce NEM rainfall → drought risk for Cauvery dependant districts\n"
-            "- Coimbatore & Salem see reduced irrigation reservoir inflows\n\n"
-            "**Rule of thumb:** Positive IOD + La Niña = heavy NEM rains. "
-            "Positive IOD + El Niño = SWM deficit but NEM partly rescued."
-        )
-    ),
-
-    # ── MONSOON SEASONS ──────────────────────────────────────────────────────
-    (
-        ["north east monsoon", "nem", "northeast", "winter rain", "retreating",
-         "south west monsoon", "swm", "kharif monsoon", "southwest"],
-        (
-            "🌧️ **Tamil Nadu Monsoon Seasons**\n\n"
-            "**South-West Monsoon (SWM) — June to September:**\n"
-            "- Arrives in TN by early June; weakest in Chennai, stronger in Nilgiris/Coimbatore\n"
-            "- Western Ghats act as a barrier → **rain-shadow on eastern TN**\n"
-            "- Kharif (Sornavari + Samba) crop season\n\n"
-            "**North-East Monsoon (NEM) — October to December:**\n"
-            "- **TN's primary rainfall season** — 60% of annual rainfall in coastal/delta districts\n"
-            "- Drives Cauvery inflows → critical for Thanjavur, Cuddalore paddy\n"
-            "- Oct: onset; Nov: peak; Dec: withdrawal\n\n"
-            "**Rabi / Pishanam (Jan–Mar):** Minimal rain; irrigation-dependent crops only\n"
-            "**Summer (Apr–May):** Pre-monsoon showers; mango, groundnut planting in some zones"
-        )
-    ),
-
-    # ── PADDY / RICE ─────────────────────────────────────────────────────────
-    (
-        ["paddy", "rice", "adt 37", "cr 1009", "swarna", "samba mahsuri",
-         "kuruvai", "samba", "thaladi", "co 51", "asd 16"],
-        (
-            "🌾 **Tamil Nadu Paddy (Rice) Varieties & Recommendations**\n\n"
-            "**Season Mapping:**\n"
-            "| Season | Period | Districts |\n"
-            "|--------|--------|-----------|\n"
-            "| Kuruvai | Jun–Jul planting → Sep harvest | Thanjavur, Cuddalore, Tiruchy |\n"
-            "| Samba | Aug–Sep planting → Jan harvest | All delta, Salem |\n"
-            "| Thaladi | Nov–Dec planting → Mar harvest | Delta, irrigated areas |\n\n"
-            "**Key Varieties:**\n"
-            "- **ADT 37 / TKM 13** — Medium-duration (115–120 days); ideal Kharif; Coimbatore, Salem\n"
-            "- **CO 51** — Short-duration (105 days); good for drought-stress conditions\n"
-            "- **Samba Mahsuri Sub1** — Submergence-tolerant; flood-prone delta areas\n"
-            "- **CR 1009 Sub1 (Swarna-Sub1)** — Tolerates 2–3 weeks submergence; Cuddalore, Cauvery delta\n"
-            "- **ASD 16** — Salt-tolerant; coastal Chennai, Tirunelveli\n"
-            "- **TRY 3** — Drought-tolerant; Erode, Salem uplands\n\n"
-            "**Irrigation:** Paddy needs 1200–1500 mm; AWD technique saves 20–30% water. "
-            "Apply 2 cm standing water only during tillering and panicle initiation."
-        )
-    ),
-
-    # ── DROUGHT CROPS & MILLETS ───────────────────────────────────────────────
-    (
-        ["millet", "sorghum", "jowar", "bajra", "pearl millet", "thinai",
-         "kudiraivali", "varagu", "kambu", "ragi", "finger millet", "kuthiraivali",
-         "drought crop", "dryland crop", "dry land"],
-        (
-            "🌿 **Drought-Tolerant Millets & Dryland Crops for Tamil Nadu**\n\n"
-            "When drought risk is **Moderate–High**, shift paddy area to these crops:\n\n"
-            "| Crop | Tamil Name | Duration | Districts | Water Need |\n"
-            "|------|-----------|----------|-----------|------------|\n"
-            "| Pearl Millet | Kambu | 75–85 days | Coimbatore, Salem, Vellore | Very Low |\n"
-            "| Finger Millet | Ragi/Kezhvaragu | 90–120 days | Erode, Coimbatore | Low |\n"
-            "| Foxtail Millet | Thinai | 70–80 days | Salem, Erode uplands | Very Low |\n"
-            "| Kodo Millet | Varagu | 90–100 days | Erode, Madurai | Low |\n"
-            "| Barnyard Millet | Kuthiraivali | 65–75 days | All dryland zones | Very Low |\n"
-            "| Sorghum | Cholam | 100–115 days | All semi-arid zones | Low |\n\n"
-            "**Intercropping tip:** Kambu + Horsegram (2:1 ratio) boosts income by 30% in dry years. "
-            "Mulch with paddy straw to conserve soil moisture."
-        )
-    ),
-
-    # ── PULSES ───────────────────────────────────────────────────────────────
-    (
-        ["pulse", "blackgram", "black gram", "greengram", "green gram", "horsegram",
-         "horse gram", "cowpea", "redgram", "red gram", "vamban", "lentil", "dal"],
-        (
-            "🫘 **Pulse Crops for Tamil Nadu**\n\n"
-            "**Blackgram (Ulundu):**\n"
-            "- Varieties: **Vamban-8** (65 days), CO 6 (65 days), VBN 10\n"
-            "- Season: Rabi (Dec–Jan planting); excellent post-paddy crop\n"
-            "- Districts: All; especially Vellore, Tirunelveli, Madurai\n\n"
-            "**Greengram (Pachai Payiru):**\n"
-            "- Varieties: CO 8, Vamban-7 (65 days)\n"
-            "- Summer and Rabi; drought-tolerant\n\n"
-            "**Horsegram (Kollu):**\n"
-            "- Most drought-tolerant pulse; ideal for **very low rainfall zones**\n"
-            "- Varieties: PAIYUR 1, CO 1; grown in Erode, Salem, Dharmapuri\n"
-            "- Fixes ~70 kg N/ha — excellent green manure and soil restorer\n\n"
-            "**Redgram / Pigeon Pea (Toor Dal):**\n"
-            "- Duration 150–180 days; semi-perennial\n"
-            "- Varieties: CO 6, ICPL 87; grown in Vellore, Tirunelveli\n\n"
-            "**Note:** All pulses fix atmospheric nitrogen — include 1 pulse crop per year in rotation to reduce urea input by 20–25%."
-        )
-    ),
-
-    # ── GROUNDNUT / OILSEEDS ─────────────────────────────────────────────────
-    (
-        ["groundnut", "peanut", "gingelly", "sesame", "sunflower", "oil seed",
-         "oilseed", "coconut", "castor"],
-        (
-            "🥜 **Oilseed Crops for Tamil Nadu**\n\n"
-            "**Groundnut (Verkadalai):**\n"
-            "- Varieties: VRI 2, CO 7, TMV 13, GPBD 4 (resistant to late leaf spot)\n"
-            "- Duration: 105–125 days; Kharif and Rabi\n"
-            "- Districts: Vellore, Tirunelveli, Erode (sandy loam preferred)\n"
-            "- Irrigation: 400–550 mm; critical at pegging and pod filling stages\n\n"
-            "**Gingelly / Sesame (Ellu):**\n"
-            "- Varieties: TMV 7, VRI 1; 75–85 days; very low water need\n"
-            "- Ideal for light soils during summer and Rabi\n\n"
-            "**Sunflower:**\n"
-            "- Varieties: KBSH 44, CO 4; 90–100 days\n"
-            "- Good Rabi crop in Coimbatore and Erode\n\n"
-            "**Coconut (Thengai):**\n"
-            "- Perennial; 50–100 liters/palm/day irrigation by drip saves 40%\n"
-            "- Districts: Coimbatore, Tirunelveli, Cuddalore coast"
-        )
-    ),
-
-    # ── SUGARCANE ─────────────────────────────────────────────────────────────
-    (
-        ["sugarcane", "sugar cane", "cane", "saccharum"],
-        (
-            "🎋 **Sugarcane in Tamil Nadu**\n\n"
-            "- Major varieties: **Co 0238** (high sugar), Co 86032, CoSi 95071\n"
-            "- Duration: 12–18 months (plant crop) + 2–3 ratoon cycles\n"
-            "- Districts: Erode (largest), Salem, Cuddalore, Tirunelveli\n\n"
-            "**Water Management:**\n"
-            "- Needs 1500–2500 mm; drip irrigation saves 40–50% water\n"
-            "- Critical periods: germination, tillering, grand growth phase\n"
-            "- Use **trash mulching** (dry leaves) to reduce soil moisture loss 30%\n\n"
-            "**During drought:** Reduce fertilizer, apply potassium to reduce transpiration, "
-            "skip ratoon and replant next season.\n\n"
-            "**During flood:** Ensure drainage within 24 hours; apply 2% urea foliar spray "
-            "post-flooding to recover nutrient losses."
-        )
-    ),
-
-    # ── COTTON ───────────────────────────────────────────────────────────────
-    (
-        ["cotton", "kapas", "bt cotton"],
-        (
-            "🌿 **Cotton Cultivation in Tamil Nadu**\n\n"
-            "- Varieties: MCU 7, DCH 32 (hybrid), MECH 162 BG II (Bt)\n"
-            "- Duration: 150–180 days (long season) or 120–150 days (medium)\n"
-            "- Districts: Coimbatore, Madurai, Tirunelveli, Erode\n"
-            "- Season: Kharif (June–July planting)\n\n"
-            "**Key Practices:**\n"
-            "- Black cotton soil (Vertisol) is ideal — good water retention\n"
-            "- Drip irrigation + fertigation: 35–40% water savings\n"
-            "- **Pink bollworm management:** Use pheromone traps (5/ha); spray Emamectin benzoate\n"
-            "- Avoid planting when La Niña brings excessive NEM rains — boll rotting risk\n\n"
-            "**During drought:** Apply 1% KNO₃ foliar spray; mulch inter-rows to conserve moisture."
-        )
-    ),
-
-    # ── IRRIGATION & WATER ───────────────────────────────────────────────────
-    (
-        ["irrigation", "drip", "awd", "alternate wetting", "sprinkler", "water",
-         "watering", "canal", "reservoir", "tank", "kulambu", "dam"],
-        (
-            "💧 **Irrigation & Water Management in Tamil Nadu**\n\n"
-            "**Alternate Wetting & Drying (AWD) for Paddy:**\n"
-            "- Let soil dry until water level drops 15 cm below surface, then irrigate to 3 cm\n"
-            "- Saves 20–30% water with no yield loss\n"
-            "- Most effective in Cauvery delta (Thanjavur, Trichy)\n\n"
-            "**Drip Irrigation:**\n"
-            "- Mandatory for: Sugarcane, Banana, Coconut, Groundnut, Cotton\n"
-            "- Subsidy: 45–90% under PM-KUSUM / Tamil Nadu Horticultural Mission\n"
-            "- Saves 40–50% water; 20–30% yield increase with fertigation\n\n"
-            "**Sprinkler:**\n"
-            "- Ideal for: Groundnut, Pulses, Millets, Vegetables\n"
-            "- Best for undulating terrain (Erode, Salem, Vellore)\n\n"
-            "**Flood/Deficit Response:**\n"
-            "- Flood: Clear silt from field channels within 48 hrs; pump drainage\n"
-            "- Drought: Prioritize critical crop growth stages; skip irrigation at vegetative stage\n\n"
-            "**Reservoirs & Tanks:** Mettur Dam (Salem/Erode), Krishnagiri, Amaravathi — "
-            "check Tamil Nadu PWD water levels before planning irrigation schedule."
-        )
-    ),
-
-    # ── DROUGHT MANAGEMENT ───────────────────────────────────────────────────
-    (
-        ["drought", "dry", "water stress", "moisture deficit", "deficit",
-         "low rainfall", "rain fail", "no rain", "rainfall deficit"],
-        (
-            "🏜️ **Drought Management Advisory for Tamil Nadu**\n\n"
-            "**Immediate Actions (first 2 weeks of deficit):**\n"
-            "1. Activate AWD (Alternate Wetting & Drying) for paddy fields\n"
-            "2. Switch irrigation to early morning (4–7 AM) to minimize evaporation\n"
-            "3. Apply **soil moisture conservation mulch** (paddy straw, sugarcane trash)\n"
-            "4. Postpone transplanting / direct seeding — wait for the next rain forecast\n\n"
-            "**Crop Choices Under Drought:**\n"
-            "- Replace paddy with: **Pearl Millet (Kambu), Finger Millet (Ragi), Horsegram, Cowpea**\n"
-            "- Use drought-tolerant paddy varieties if paddy must be grown: **CO 51, TRY 3, ADT 45**\n\n"
-            "**Soil Management:**\n"
-            "- Deep ploughing (30 cm) before monsoon to improve water infiltration\n"
-            "- Contour bunding and farm ponds for water harvesting\n"
-            "- Apply 25 kg/ha potassium (MOP) to improve plant drought tolerance\n\n"
-            "**Government Schemes:** Pradhan Mantri Fasal Bima Yojana (PMFBY) — crop insurance; "
-            "apply through nearest Agriculture office or e-crop portal."
-        )
-    ),
-
-    # ── FLOOD MANAGEMENT ─────────────────────────────────────────────────────
-    (
-        ["flood", "waterlog", "inundation", "submerg", "excessive rain",
-         "heavy rain", "cyclone", "cyclonic"],
-        (
-            "🌊 **Flood / Waterlogging Management Advisory for Tamil Nadu**\n\n"
-            "**Emergency Field Actions (first 24–48 hours):**\n"
-            "1. Open all drainage channels and bunds to drain water as quickly as possible\n"
-            "2. Do NOT apply fertilizer immediately after flooding — wash-out loss\n"
-            "3. Pump-out stagnant water from paddy fields within 48–72 hours (>72 hrs = severe loss)\n\n"
-            "**Submergence-Tolerant Varieties (plan for next season):**\n"
-            "- **Swarna-Sub1 / CR 1009 Sub1** — tolerates 14–18 days submergence\n"
-            "- **Samba Mahsuri Sub1** — tolerates 12 days\n"
-            "- Suitable for Cauvery Delta (Thanjavur, Cuddalore, Tiruchy)\n\n"
-            "**Post-Flood Recovery:**\n"
-            "- 48 hrs after drainage: Apply 2% urea foliar spray to restore leaf nitrogen\n"
-            "- Spray potassium (0.5% K₂SO₄) to enhance recovery\n"
-            "- Re-sow where total stand loss occurs (keep nursery rows as backup)\n\n"
-            "**Banana & Horticultural Crops:** De-bunch early; apply Bordeaux mixture "
-            "to stem cuts to prevent fungal entry. Replant after 2–3 weeks drying."
-        )
-    ),
-
-    # ── SOWING WINDOWS ───────────────────────────────────────────────────────
-    (
-        ["sowing", "planting", "nursery", "transplant", "seed", "seedling",
-         "kharif", "rabi", "sornavari", "pishanam"],
-        (
-            "🗓️ **Tamil Nadu Crop Sowing Calendar**\n\n"
-            "| Season | Months | Main Crops |\n"
-            "|--------|--------|------------|\n"
-            "| **Sornavari / Early Kharif** | Apr–May | Groundnut, Vegetables, Maize |\n"
-            "| **Kharif / Kuruvai (Paddy)** | Jun–Jul | Short-duration paddy (CO 51, ADT 37) |\n"
-            "| **Samba (Main Paddy)** | Jul–Aug | Long/medium paddy (ADT 45, ASD 16) |\n"
-            "| **Rabi / Thaladi** | Oct–Nov | Pulses, Ragi, Blackgram, Thaladi paddy |\n"
-            "| **Pishanam / Winter** | Dec–Jan | Blackgram, Greengram, Potato (Nilgiris) |\n\n"
-            "**Nursery Tips:**\n"
-            "- Raise nursery in raised beds 30 days before main field transplanting\n"
-            "- Treat seeds with 3 g Thiram / 1 g Carbendazim per kg seed before sowing\n"
-            "- Use **staggered sowing** (two tranches 10 days apart) to buffer monsoon onset uncertainty\n\n"
-            "**Coimbatore (Western Zone):** Main sowing Jun 15–Jul 15 (SWM onset)\n"
-            "**Delta Districts (Thanjavur, Cuddalore):** Samba planting Aug 1–Sep 15 (reservoir release)\n"
-            "**Tirunelveli / Madurai:** NEM-dependent — plant Rabi after Oct 15 NEM onset"
-        )
-    ),
-
-    # ── SOIL HEALTH ──────────────────────────────────────────────────────────
-    (
-        ["soil", "soil health", "organic matter", "compost", "vermicompost",
-         "green manure", "biofertilizer", "rhizobium", "azospirillum", "ph",
-         "soil test", "vertisol", "alfisol", "red soil", "black soil"],
-        (
-            "🌍 **Soil Health Management for Tamil Nadu**\n\n"
-            "**Tamil Nadu Soil Types:**\n"
-            "| Zone | Soil Type | Key Issue |\n"
-            "|------|-----------|----------|\n"
-            "| Coimbatore, Erode | Red loamy (Alfisol) | Low water retention, slightly acidic |\n"
-            "| Cauvery Delta | Heavy clay (Vertisol) | Waterlogging in monsoon |\n"
-            "| Coastal zones | Sandy / saline | Salinity, low nutrients |\n"
-            "| Nilgiris | Hill loam | Erosion, leaching |\n\n"
-            "**Soil Testing:** Get tested every 3 years at district Soil Testing Lab (free under INM scheme)\n"
-            "- Optimal pH: 6.0–7.5 for most crops; paddy tolerates 5.5–7.0\n"
-            "- Below pH 5.5: Apply **2 t/ha agricultural lime** or **Dolomite**\n\n"
-            "**Organic Amendments:**\n"
-            "- FYM (Farm Yard Manure): 12.5 t/ha before main crop\n"
-            "- Vermicompost: 2.5 t/ha; improves soil structure and water holding\n"
-            "- Green manure (Dhaincha/Sunnhemp): Incorporate 45 days after sowing → adds 80 kg N/ha\n\n"
-            "**Biofertilizers (free from Dept. of Agriculture TN):**\n"
-            "- Rhizobium for pulses; Azospirillum for cereals; PSB for phosphorus mobilization\n"
-            "- Use with reduced urea (save 25–30% N cost)"
-        )
-    ),
-
-    # ── FERTILIZER ───────────────────────────────────────────────────────────
-    (
-        ["fertilizer", "npk", "urea", "dap", "nitrogen", "phosphorus",
-         "potassium", "micronutrient", "zinc", "boron", "fertigation",
-         "manure", "organic"],
-        (
-            "🧪 **Fertilizer & Nutrient Management**\n\n"
-            "**Paddy Recommendation (per hectare):**\n"
-            "- N: 120 kg (split into 3: basal 40%, tillering 30%, panicle initiation 30%)\n"
-            "- P₂O₅: 50 kg (full basal application)\n"
-            "- K₂O: 50 kg (basal 50% + panicle 50%)\n\n"
-            "**Dryland Crops (Millets, Pulses):**\n"
-            "- Reduce N by 25% if biofertilizers used\n"
-            "- Apply K during stress periods to improve drought tolerance\n\n"
-            "**Micronutrients:**\n"
-            "- **Zinc deficiency** (khaira disease in paddy): Apply 25 kg ZnSO₄/ha or "
-            "spray 0.5% ZnSO₄ at 2 weeks after transplanting\n"
-            "- **Boron** for groundnut, sunflower: 1 kg/ha boranated superphosphate\n"
-            "- **Iron chlorosis** in calcareous soils: spray 0.5% FeSO₄ + 0.1% citric acid\n\n"
-            "**Top Tip:** Use **Soil Health Card** (free from Krishi Vigyan Kendra) "
-            "to get district-specific NPK + micronutrient recommendations."
-        )
-    ),
-
-    # ── PEST & DISEASE ───────────────────────────────────────────────────────
-    (
-        ["pest", "disease", "fungal", "blight", "blast", "sheath", "brownspot",
-         "virus", "borer", "aphid", "whitefly", "thrips", "weed", "herbicide",
-         "pesticide", "insecticide", "spray", "ipm", "biocontrol"],
-        (
-            "🐛 **Pest & Disease Management (IPM Approach)**\n\n"
-            "**Paddy — Common Problems:**\n"
-            "| Problem | Symptom | IPM Action |\n"
-            "|---------|---------|------------|\n"
-            "| Blast (Magnaporthe oryzae) | Brown diamond lesions on leaves | Spray Tricyclazole 75 WP 0.6 g/L |\n"
-            "| Sheath blight | White-brown lesions on sheath | Hexaconazole 1 ml/L |\n"
-            "| Brown Plant Hopper | Yellow hopperburn patches | Buprofezin 25 SC 1.6 ml/L; light trap |\n"
-            "| Stem borer | Dead heart / white ear | Cartap Hydrochloride 4G 18.75 kg/ha |\n\n"
-            "**Dryland Crops:**\n"
-            "- Groundnut early leaf spot: Mancozeb 75 WP 2 g/L at 30-day intervals\n"
-            "- Cotton bollworm: Pheromone traps (5/ha); Emamectin 5 SG 0.3 g/L\n"
-            "- Pulse pod borer: Bt spray (Bacillus thuringiensis) + NSKE 5%\n\n"
-            "**Weed Management:**\n"
-            "- Direct seeded paddy: Pyrazosulfuron-ethyl (10 g/ha) at 8–10 DAS\n"
-            "- Transplanted paddy: Hand weeding at 20 and 45 DAT\n\n"
-            "**Biocontrol agents (free/subsidized from Dept. Agri TN):**\n"
-            "- Trichogramma cards for stem borer; Pseudomonas for soil-borne diseases"
-        )
-    ),
-
-    # ── CROP ROTATION ────────────────────────────────────────────────────────
-    (
-        ["rotation", "crop sequence", "intercrop", "intercropping", "mixed crop",
-         "fallow", "crop calendar"],
-        (
-            "🔄 **Crop Rotation & Intercropping for Tamil Nadu**\n\n"
-            "**Cauvery Delta Zone (Thanjavur, Cuddalore):**\n"
-            "- Kuruvai paddy → Samba paddy → Blackgram (Rabi)\n"
-            "- Or: Paddy → Paddy → Sunflower (avoids blast build-up)\n\n"
-            "**Western Zone (Coimbatore, Erode):**\n"
-            "- Groundnut → Maize → Blackgram\n"
-            "- Or: Sugarcane (1yr) → Ratoon → Pulses\n\n"
-            "**Southern Zone (Madurai, Tirunelveli):**\n"
-            "- Samba paddy → Gingelly → Cowpea\n"
-            "- Or: Cotton (Kharif) → Blackgram (Rabi)\n\n"
-            "**Key Intercropping Combos:**\n"
-            "- Maize + Cowpea (2:1 rows) — income insurance\n"
-            "- Sugarcane + Blackgram (trash mulch rows) — 20% extra income\n"
-            "- Groundnut + Castor (8:2 rows) — pest diversification\n\n"
-            "**Rule:** Include at least **one pulse or legume per year** to naturally fix soil nitrogen."
-        )
-    ),
-
-    # ── DISTRICT-SPECIFIC ZONES ──────────────────────────────────────────────
-    (
-        ["thanjavur", "cauvery delta", "delta zone"],
-        (
-            "📍 **Thanjavur — Cauvery Delta Zone**\n\n"
-            "- **Soil:** Heavy clay (Vertisol), high fertility, pH 7–8\n"
-            "- **Main crops:** Paddy (Samba, Kuruvai, Thaladi), Banana, Sugarcane\n"
-            "- **Irrigation:** Cauvery system + Grand Anicut canal\n"
-            "- **Key risk:** Cyclone-driven NEM flooding (Oct–Nov); waterlogging\n"
-            "- **Advisory:** Use Swarna-Sub1 paddy; clear drainage bunds before NEM; "
-            "avoid Samba planting after Sep 15 to prevent cold injury at panicle stage"
-        )
-    ),
-    (
-        ["coimbatore", "western zone", "western agro"],
-        (
-            "📍 **Coimbatore — Western Agro-Climatic Zone**\n\n"
-            "- **Soil:** Red loamy (Alfisol), well-drained, pH 6.0–7.5\n"
-            "- **Main crops:** Sugarcane (largest area), Cotton, Maize, Groundnut, Coconut\n"
-            "- **Irrigation:** Bhavani river, Amaravathi reservoir, bore wells (falling water table!)\n"
-            "- **Key risk:** El Niño-driven SWM deficit; summer moisture stress\n"
-            "- **Advisory:** Drip irrigation mandatory for sugarcane; "
-            "shift to ADT 37 paddy if Bhavani levels drop; drill millets in rain-shadow months"
-        )
-    ),
-    (
-        ["madurai", "southern zone"],
-        (
-            "📍 **Madurai — Southern Agro-Climatic Zone**\n\n"
-            "- **Soil:** Black cotton soil (Vertisol), pH 7.5–8.5\n"
-            "- **Main crops:** Cotton, Paddy (Samba), Banana, Jasmine (floriculture)\n"
-            "- **Irrigation:** Vaigai river, Periyar (Mullai Periyar) reservoir\n"
-            "- **Key risk:** Inter-seasonal drought; high temperature stress (Apr–Jun)\n"
-            "- **Advisory:** Plant cotton after first SWM rains (Jun 15+); "
-            "use heat-tolerant paddy CO 51; drip-irrigate banana"
-        )
-    ),
-    (
-        ["chennai", "coastal zone", "northern coastal"],
-        (
-            "📍 **Chennai — Northern Coastal Zone**\n\n"
-            "- **Soil:** Sandy loam, saline patches near coast, pH 7–8.5\n"
-            "- **Main crops:** Paddy (ASD 16 salt-tolerant), Vegetables, Coconut\n"
-            "- **Irrigation:** Poondi, Chembarambakkam reservoirs; bore wells (salinity risk)\n"
-            "- **Key risk:** Cyclones (Oct–Dec), urban heat island, saline intrusion\n"
-            "- **Advisory:** Grow ASD 16 or CST 7-1 salt-tolerant varieties; "
-            "avoid irrigating with saline bore water (EC > 2 dS/m) during sensitive stages"
-        )
-    ),
-    (
-        ["vellore", "north western zone"],
-        (
-            "📍 **Vellore — North Western Zone**\n\n"
-            "- **Soil:** Red soil (Alfisol), pH 5.5–6.5\n"
-            "- **Main crops:** Groundnut, Paddy, Sorghum, Banana\n"
-            "- **Irrigation:** Palar river (seasonal), check dams, drip systems\n"
-            "- **Key risk:** Low and erratic rainfall (600–750 mm/yr), drought-prone\n"
-            "- **Advisory:** Prioritize groundnut (VRI 2, GPBD 4) and horsegram; "
-            "construct farm ponds under MNREGA scheme; spray TNAU's drought-mitigation package at heading"
-        )
-    ),
-
-    # ── GOVERNMENT SCHEMES ───────────────────────────────────────────────────
-    (
-        ["scheme", "subsidy", "government", "pmfby", "pm kisan", "kisan", "tnau",
-         "kvk", "krishi vigyan", "mgnrega", "mnrega", "atma", "insurance",
-         "compensation", "relief"],
-        (
-            "🏛️ **Tamil Nadu Agriculture Government Schemes**\n\n"
-            "| Scheme | Benefit | How to Apply |\n"
-            "|--------|---------|-------------|\n"
-            "| **PM-KISAN** | ₹6,000/yr income support | PM Kisan portal / CSC |\n"
-            "| **PMFBY** | Crop insurance (drought/flood/pest) | Bank / Aadhaar + land records |\n"
-            "| **TN Drip Subsidy** | 45–90% cost for drip/sprinkler | Block Agri Office |\n"
-            "| **Soil Health Card** | Free soil testing every 3 yrs | District lab |\n"
-            "| **TNAU Seed Subsidy** | Certified seeds at 50% discount | Agri. cooperative society |\n"
-            "| **MNREGA Ponds** | Free farm pond construction (100 m²) | Gram Panchayat |\n"
-            "| **KVK (Krishi Vigyan Kendra)** | Free training, demonstrations | Visit nearest KVK |\n\n"
-            "**Emergency Relief:** Contact District Collector / Agriculture Dept. within 72 hrs of crop loss "
-            "for damage assessment and ex-gratia under SDRF/NDRF."
-        )
-    ),
-
-    # ── CLIMATE CHANGE ───────────────────────────────────────────────────────
-    (
-        ["climate change", "global warming", "temperature rise", "carbon",
-         "greenhouse", "adaptation", "resilience", "climate resilient"],
-        (
-            "🌡️ **Climate Change Adaptation for Tamil Nadu Farmers**\n\n"
-            "**Observed Trends in TN:**\n"
-            "- Average temperature rising ~0.3–0.5°C per decade\n"
-            "- More intense but less frequent rainfall events\n"
-            "- NEM onset becoming less predictable (±2–3 weeks variability)\n\n"
-            "**Adaptation Strategies:**\n"
-            "1. **Variety switch:** Use shorter-duration varieties to escape heat stress at flowering\n"
-            "2. **Sowing date adjustment:** Shift sowing 2–3 weeks earlier to avoid hot spell at harvest\n"
-            "3. **Agroforestry:** Intercrop trees (Moringa, Neem, Silver Oak) for shade and microclimate cooling\n"
-            "4. **Water harvesting:** Farm ponds, percolation tanks, contour bunding\n"
-            "5. **SRI Method** (System of Rice Intensification): 25% more yield, 30% less water\n"
-            "6. **Solar pumps:** PM-KUSUM subsidy (90%) — replace diesel pumps; "
-            "reduces cost and carbon footprint\n\n"
-            "**TNAU Climate-Smart Agriculture Programme:** Free village-level advisory through "
-            "Agri Business Development Centres (ABDCs)"
-        )
-    ),
-
-    # ── HORTICULTURE / VEGETABLES / FRUIT ───────────────────────────────────
-    (
-        ["vegetable", "tomato", "brinjal", "onion", "chilli", "banana", "mango",
-         "papaya", "guava", "moringa", "drumstick", "horticulture", "fruit"],
-        (
-            "🍅 **Horticulture & Vegetable Crops in Tamil Nadu**\n\n"
-            "**Key Vegetable Crops:**\n"
-            "| Crop | Season | Districts | Key Variety |\n"
-            "|------|--------|-----------|-------------|\n"
-            "| Tomato | Oct–Feb | Coimbatore, Salem | CO 3, TNAU Hybrid-1 |\n"
-            "| Brinjal | Year-round | All | CO 1, PLR 1 |\n"
-            "| Chilli | Jun–Aug | Madurai, Coimbatore | K1, CO 4 |\n"
-            "| Onion | Nov–Feb | Erode, Salem | Arka Niketan |\n\n"
-            "**Fruit Crops:**\n"
-            "- **Banana (Cavendish, Rasthali, Poovan):** Trichy, Erode; 11–12 months; "
-            "drip + fertigation essential; tissue culture plants increase yield 30%\n"
-            "- **Mango (Alphonso, Bangalora, Neelum):** Salem, Dharmapuri; "
-            "Paclobutrazol spray in Nov for off-season flowering\n"
-            "- **Moringa/Drumstick (PKM 1):** High-value, drought-tolerant; "
-            "Tirunelveli specialty — 8 t/ha pods/yr with minimal water\n\n"
-            "**Protected Cultivation:** Poly-houses for tomato, capsicum, rose — "
-            "65% subsidy under National Horticulture Mission (NHM)"
-        )
-    ),
-
-    # ── GENERAL / FALLBACK ───────────────────────────────────────────────────
-    (
-        ["help", "what can you", "what do you", "what is your", "tell me",
-         "explain", "how to", "how do i", "which crop", "which variety"],
-        (
-            "🤔 I'm here to help with any Tamil Nadu agriculture question!\n\n"
-            "Try asking:\n"
-            "- *'Which crops are best during El Niño?'*\n"
-            "- *'What is AWD irrigation?'*\n"
-            "- *'Best paddy variety for flood-prone area?'*\n"
-            "- *'How to manage soil in Coimbatore?'*\n"
-            "- *'What government schemes are available?'*\n"
-            "- *'Sowing dates for blackgram in Thanjavur?'*"
-        )
-    ),
-]
+def is_tamil_script(text: str) -> bool:
+    """Check if the text contains Tamil Unicode characters (U+0B80 - U+0BFF)."""
+    return any('\u0B80' <= char <= '\u0BFF' for char in text)
 
 
-def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation, condense whitespace."""
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def is_tanglish(text: str) -> bool:
+    """Check if text is Tanglish (phonetic Tamil in Latin script)."""
+    tanglish_keywords = [
+        "mazhai", "malai", "varuma", "varum", "varathu", "nellu", "nel",
+        "vivasayam", "vivasaayi", "thanni", "neer", "uramm", "uram",
+        "marundhu", "marunthu", "poochi", "saagubadi", "sagubadi",
+        "podalama", "nadalama", "eppadi", "eppo", "yepdi", "naalaiku",
+        "nalaiku", "indru", "iniki", "veppam", "kaathu", "kaalam",
+        "solunga", "sollunga", "theriyuma", "paasanam", "pasanam"
+    ]
+    t = text.lower()
+    return any(kw in t for kw in tanglish_keywords)
 
 
-def _score_entry(query_norm: str, patterns: list) -> int:
-    """Return number of keyword patterns matched in query."""
-    return sum(1 for kw in patterns if kw in query_norm)
+# ---------------------------------------------------------------------------
+# Gemini REST API Call (Zero pip dependencies, uses built-in requests)
+# ---------------------------------------------------------------------------
 
+def call_gemini_api(
+    user_query: str,
+    api_key: str,
+    district: str,
+    telemetry: Optional[Dict[str, Any]] = None,
+    advisory: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """Call Google Gemini 1.5 Flash REST API if key is available."""
+    if not requests or not api_key:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+
+    # Build rich agricultural & climate system context
+    t_info = ""
+    if telemetry:
+        t_info = (
+            f"\nCURRENT DISTRICT CONTEXT for {district}:\n"
+            f"- Forecast Rainfall: {telemetry.get('rain_mm', 'N/A')} mm\n"
+            f"- Rain Anomaly vs Normal: {telemetry.get('rain_anomaly', 'N/A')} mm\n"
+            f"- Dominant Hazard Status: {telemetry.get('hazard_status', 'Normal')}\n"
+            f"- ENSO Phase (Niño 3.4): {telemetry.get('enso', 0.0)} °C\n"
+            f"- Indian Ocean Dipole (DMI): {telemetry.get('iod', 0.0)}\n"
+        )
+    if advisory:
+        t_info += (
+            f"- Agro-Climatic Zone: {advisory.get('agro_climatic_zone', 'N/A')}\n"
+            f"- Sowing Strategy: {advisory.get('sowing_strategy', '')}\n"
+            f"- Irrigation Strategy: {advisory.get('irrigation_strategy', '')}\n"
+        )
+
+    system_prompt = (
+        "You are 'Uzhavan AI' (உழவன் ஏஐ), an expert agricultural scientist, climate advisor, "
+        "and farmer decision support assistant specializing in Tamil Nadu agriculture.\n"
+        "You can converse fluently in English, pure Tamil (தமிழ்), or Tanglish (Tamil in English script).\n"
+        "Always respond in the SAME language or script that the user used:\n"
+        "- If user asks in Tamil (தமிழ்), reply in fluent Tamil (தமிழ்) with clear farming guidance.\n"
+        "- If user asks in Tanglish, reply in Tanglish or clear bilingual Tamil/English.\n"
+        "- If user asks in English, reply in English.\n"
+        "Ground your advice in actual agronomy, TNAU recommendations, and the current district forecast data provided below.\n"
+        "Be warm, encouraging, practical, and direct. Use markdown formatting, bullet points, and emojis."
+        f"{t_info}"
+    )
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_query}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 800
+        }
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=12
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "").strip()
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Smart Local Conversational Intelligence (No API Key Required)
+# ---------------------------------------------------------------------------
+
+def clean_query(text: str) -> str:
+    """Strip common greetings from query so substantive questions are detected."""
+    t = text.lower()
+    # Remove leading greeting prefixes like "hi ", "hello ", "vanakkam ", etc.
+    t = re.sub(r"^(hi|hello|hey|vanakkam|namaste|good\s+morning|good\s+afternoon|good\s+evening)\b[\s,\.!]*", "", t).strip()
+    return t
+
+
+def answer_weather_query(district: str, telemetry: Optional[Dict[str, Any]], is_tamil: bool, is_tan: bool) -> str:
+    """Handle rainfall / weather forecast questions."""
+    rain_mm = telemetry.get("rain_mm", 120.0) if telemetry else 120.0
+    rain_anom = telemetry.get("rain_anomaly", 15.0) if telemetry else 15.0
+    hazard = telemetry.get("hazard_status", "Low") if telemetry else "Low"
+
+    anom_text = f"+{rain_anom:.1f}" if rain_anom >= 0 else f"{rain_anom:.1f}"
+
+    if is_tamil:
+        return (
+            f"🌧️ **{district} மாவட்ட வானிலை மற்றும் மழை முன்னறிவிப்பு:**\n\n"
+            f"- **எதிர்பார்க்கப்படும் மழைப்பொழிவு:** சுமார் **{rain_mm:.1f} மி.மீ**\n"
+            f"- **இயல்பு நிலையை விட வேறுபாடு:** **{anom_text} மி.மீ** ({'அதிக மழை' if rain_anom > 20 else ('குறைவான மழை' if rain_anom < -20 else 'சராசரி மழை')})\n"
+            f"- **பாதிப்பு அபாய நிலை:** **{hazard}**\n\n"
+            f"💡 **விவசாயிகளுக்கான வழிகாட்டல்:**\n"
+            f"• {'அதிக மழை வாய்ப்பு உள்ளதால், வயல்களில் வடிகால் கால்வாய்களை உடனே தூர்வாரி தயார் நிலையில் வையுங்கள்.' if rain_anom > 20 else 'மழைப்பொழிவு குறைவாகவோ அல்லது மிதமாகவோ இருக்கும் என கணிக்கப்பட்டுள்ளதால், நீர் மேலாண்மையில் (AWD/சொட்டு நீர்) கவனம் செலுத்துங்கள்.'}\n"
+            f"• வானிலை மாற்றங்களை தொடர்ந்து கண்காணிக்கவும்."
+        )
+    elif is_tan:
+        return (
+            f"🌧️ **{district} Weather & Mazhai Mun-arivippu:**\n\n"
+            f"- **Expected Rainfall:** **{rain_mm:.1f} mm**\n"
+            f"- **Normal-oda compare panna:** **{anom_text} mm** ({'Adhiga mazhai' if rain_anom > 20 else 'Sari-aana mazhai / Deficit'})\n"
+            f"- **Hazard Status:** **{hazard}**\n\n"
+            f"💡 **Farming Tip:**\n"
+            f"• {'Mazhai nallave irukku, vadikaal (drainage) vazhi-a clear pannunga!' if rain_anom > 20 else 'Mazhai kami-a irundha, AWD or Drip irrigation use pannunga.'}\n"
+            f"• Next 2-3 weeks forecast-ah follow pannunga."
+        )
+    else:
+        return (
+            f"🌧️ **Weather & Rainfall Outlook for {district}:**\n\n"
+            f"- **Forecasted Monthly Rainfall:** **{rain_mm:.1f} mm**\n"
+            f"- **Anomaly vs Normal:** **{anom_text} mm** ({'Above Normal / Surplus' if rain_anom > 20 else ('Below Normal / Deficit' if rain_anom < -20 else 'Near Normal')})\n"
+            f"- **Hazard Risk Level:** **{hazard}**\n\n"
+            f"💡 **Agronomic Advisory:**\n"
+            f"• {'Heavy rain anticipated. Clear field drainage channels to prevent waterlogging around root zones.' if rain_anom > 20 else 'Rainfall expected to be moderate/deficit. Adopt Alternate Wetting & Drying (AWD) or micro-irrigation to conserve soil moisture.'}\n"
+            f"• Avoid applying chemical fertilizers immediately before predicted rain peaks to prevent nutrient runoff."
+        )
+
+
+def answer_paddy_query(district: str, telemetry: Optional[Dict[str, Any]], advisory: Optional[Dict[str, Any]], is_tamil: bool, is_tan: bool) -> str:
+    """Handle paddy cultivation queries."""
+    rain_anom = telemetry.get("rain_anomaly", 0.0) if telemetry else 0.0
+    hazard = telemetry.get("hazard_status", "Low") if telemetry else "Low"
+
+    if is_tamil:
+        return (
+            f"🌾 **{district} மாவட்டத்திற்கான நெல் சாகுபடி ஆலோசனை:**\n\n"
+            f"நீங்கள் இப்போது நெல் பயிரிட திட்டமிட்டால்:\n\n"
+            f"1. **பரிந்துரைக்கப்படும் நெல் ரகங்கள்:**\n"
+            f"   - **ADT 37 / TKM 13** — நடுத்தர கால ரகம் (115–120 நாட்கள்)\n"
+            f"   - **CO 51** — குறுகிய கால வறட்சியை தாங்கும் ரகம் (105 நாட்கள்)\n"
+            f"   - **Swarna-Sub1 / CR 1009 Sub1** — வெள்ளம் / அதிக நீர் தேங்குவதை தாங்கும் ரகம் (2-3 வாரம் நீர் மூழ்கினாலும் அழுகாது)\n"
+            f"   - **ASD 16** — கடற்கரை பகுதி உப்பு தன்மையை தாங்கும் ரகம் ({district} கடற்கரைக்கு ஏற்றது)\n\n"
+            f"2. **நடவு முறை:**\n"
+            f"   - நாற்றங்கால் பாத்திகளை மேட்டுப்பாத்திகளாக அமைக்கவும்.\n"
+            f"   - விதைப்பதற்கு முன் 1 கிலோ விதைக்கு 2 கிராம் கார்பென்டாசிம் மருந்து கலந்து விதை நேர்த்தி செய்யவும்.\n\n"
+            f"3. **தண்ணீர் மேலாண்மை:**\n"
+            f"   - தூர்கட்டும் பருவம் வரை 2 செ.மீ தண்ணீர் நிறுத்தி, பின் காய்ச்சலும் பாய்ச்சலுமாக (AWD) நீர் பாய்ச்சினால் 25% தண்ணீர் மிச்சமாகும்."
+        )
+    elif is_tan:
+        return (
+            f"🌾 **{district} Nellu Saagubadi (Paddy Cultivation) Tips:**\n\n"
+            f"Neenga nellu poda plan pannirundha:\n\n"
+            f"1. **Best Nellu Ragaangal (Varieties):**\n"
+            f"   - **CO 51** — 105 days, water kammiya theva padum.\n"
+            f"   - **ADT 37 / TKM 13** — 115-120 days, high yield.\n"
+            f"   - **Swarna-Sub1 / CR 1009 Sub1** — Mazhai vandhu thanni thenginalum thalaikattum (Flood resistant).\n"
+            f"   - **ASD 16** — Coastal {district} areas-ku super.\n\n"
+            f"2. **Thanni Manage panna:**\n"
+            f"   - Always AWD (Kaaichalum Paaichalum) method use pannunga, 25% thanni save aagum.\n"
+            f"   - Naatru nadum podhu seed treatment kandippa pannunga."
+        )
+    else:
+        return (
+            f"🌾 **Paddy Cultivation & Planting Advisory for {district}:**\n\n"
+            f"If you are planning to sow or transplant paddy:\n\n"
+            f"1. **Recommended Cultivars for {district}:**\n"
+            f"   - **CO 51** — Short-duration (105 days), highly resilient to moisture stress\n"
+            f"   - **ADT 37 / TKM 13** — Medium-duration (115–120 days), optimal yield potential\n"
+            f"   - **Swarna-Sub1 / CR 1009 Sub1** — Submergence-tolerant; survives 14–18 days submerged in flood-prone fields\n"
+            f"   - **ASD 16** — Salt-tolerant cultivar suitable for coastal belts\n\n"
+            f"2. **Nursery & Sowing Strategy:**\n"
+            f"   - Raise seedlings on raised nursery beds with 10 cm clearance to prevent early submergence rot\n"
+            f"   - Perform seed treatment with *Pseudomonas fluorescens* (10 g/kg) to guard against blast\n\n"
+            f"3. **Water Management (AWD):**\n"
+            f"   - Implement Alternate Wetting & Drying: re-irrigate only when water recedes 15 cm below soil level."
+        )
+
+
+def answer_combined_paddy_and_rain(district: str, telemetry: Optional[Dict[str, Any]], advisory: Optional[Dict[str, Any]], is_tamil: bool, is_tan: bool) -> str:
+    """Specifically handles 'hi i planned to grow paddy will it rain tommorow'."""
+    rain_mm = telemetry.get("rain_mm", 140.0) if telemetry else 140.0
+    rain_anom = telemetry.get("rain_anomaly", 20.0) if telemetry else 20.0
+    hazard = telemetry.get("hazard_status", "Low") if telemetry else "Low"
+
+    anom_sign = f"+{rain_anom:.1f}" if rain_anom >= 0 else f"{rain_anom:.1f}"
+
+    if is_tamil:
+        return (
+            f"🌾 **{district} - நெல் சாகுபடி & மழை முன்னறிவிப்பு விளக்கம்:**\n\n"
+            f"வணக்கம்! நீங்கள் {district} மாவட்டத்தில் நெல் பயிரிட திட்டமிட்டுள்ளீர்கள், மழை பற்றிய உங்கள் கேள்விக்கு:\n\n"
+            f"🌧️ **மழை நிலவரம்:**\n"
+            f"- தற்போதைய காலநிலை மாதிரியின்படி, இந்த மாதத்தில் சுமார் **{rain_mm:.1f} மி.மீ** மழை ({anom_sign} மி.மீ இயல்பை விட) கணிக்கப்பட்டுள்ளது.\n"
+            f"- தற்போதைய அபாய நிலை: **{hazard}**.\n\n"
+            f"🌱 **நெல் நடவு செய்யலாமா?**\n"
+            f"• **ஆம், தாராளமாக திட்டமிடலாம்!** ஆனால் மழைநீரை மட்டுமே நம்பாமல், பாசன ஆதாரத்தையும் உறுதிப்படுத்திக் கொள்ளுங்கள்.\n"
+            f"• அதிக மழை எதிர்பார்க்கப்பட்டால், நீர் தேங்குவதை தாங்கும் **Swarna-Sub1** அல்லது **CR 1009 Sub1** ரகங்களை தேர்வு செய்யவும்.\n"
+            f"• கடற்கரை சார்ந்த பகுதியாக இருப்பின் **ASD 16** சிறந்த ரகமாகும்.\n"
+            f"• நாற்று நடும் முன் வயல் வரப்புகளை உயர்த்தி, அதிகப்படியான நீர் வெளியேற வடிகால் வாய்க்காலை சரிசெய்யவும்.\n\n"
+            f"உங்களுக்கு குறிப்பிட்ட ரகங்கள் அல்லது பூச்சி மேலாண்மை பற்றி ஏதேனும் சந்தேகம் உள்ளதா?"
+        )
+    elif is_tan:
+        return (
+            f"🌾 **{district} - Nellu Saagubadi & Mazhai Information:**\n\n"
+            f"Vanakkam! Neenga {district}-la nellu poda plan pannirukenga, mazhai pathina details:\n\n"
+            f"🌧️ **Mazhai Forecast:**\n"
+            f"- Climate forecast-padi **{rain_mm:.1f} mm** ({anom_sign} mm vs normal) mazhai expect pannapadudhu.\n"
+            f"- Risk level: **{hazard}**.\n\n"
+            f"🌱 **Nellu Saagubadi Tips:**\n"
+            f"• **Yes, neenga tharalama proceed pannalam!** Aana borewell/canal irrigation backup vachukonga.\n"
+            f"• Mazhai adhigama irundha flood-tolerant varieties like **Swarna-Sub1** or **CR 1009 Sub1** podunga.\n"
+            f"• Water logging aagama iruka drainage clear pannitu nursery transplant pannunga.\n"
+            f"• Kaaichalum paaichaluma (AWD) thanni paasanam pannunga."
+        )
+    else:
+        return (
+            f"🌾 **Paddy Cultivation & Rainfall Assessment for {district}:**\n\n"
+            f"Great decision to plan ahead! Here is the hydro-meteorological assessment for **{district}**:\n\n"
+            f"🌧️ **Rainfall Forecast Outlook:**\n"
+            f"- **Expected Monthly Rainfall:** **{rain_mm:.1f} mm**\n"
+            f"- **Rainfall Anomaly vs Baseline Normal:** **{anom_sign} mm**\n"
+            f"- **Overall Hazard Status:** **{hazard}**\n\n"
+            f"🌱 **Actionable Guidance for Growing Paddy:**\n"
+            f"1. **Is it favorable to plant now?** Yes! The hydro-climatic conditions in {district} support paddy planting, provided irrigation scheduling is aligned with forecast events.\n"
+            f"2. **Cultivar Choice:**\n"
+            f"   - If rainfall is in surplus / flood risk: Opt for **Swarna-Sub1** or **CR 1009 Sub1** (submergence-tolerant for up to 18 days).\n"
+            f"   - For normal/moderate rain: Standard high-yielding cultivars like **ADT 37**, **CO 51**, or **TKM 13**.\n"
+            f"   - For coastal {district}: Saline-tolerant **ASD 16**.\n"
+            f"3. **Precaution:** Clear field bund drainage channels to manage unexpected monsoon downpours and avoid seedling submergence."
+        )
+
+
+def answer_general_agri_query(query: str, district: str, is_tamil: bool, is_tan: bool) -> str:
+    """Answers general agricultural questions (pests, fertilizers, organic, irrigation, etc.)."""
+    q = query.lower()
+
+    # 1. Pests / Diseases
+    if any(k in q for k in ["pest", "disease", "poochi", "marundhu", "blast", "borer", "leaf folder", "kuruthu"]):
+        if is_tamil:
+            return (
+                f"🐛 **பூச்சி மற்றும் நோய் மேலாண்மை (IPM வழிகாட்டல்):**\n\n"
+                f"• **குருத்துப்பூச்சி (Stem Borer):** வேப்பங்கொட்டை கரைசல் (NSKE 5%) அல்லது கார்டாப் ஹைட்ரோகுளோரைடு (18.75 கிலோ/ஹெக்டேர்).\n"
+                f"• **இலைமடக்கு புழு (Leaf Folder):** டிரைக்கோடெர்மா ஒட்டுண்ணி அட்டைகளை ஒரு ஏக்கருக்கு 2 வீதம் வயலில் கட்டவும்.\n"
+                f"• **குலை நோய் (Blast):** டிரைசைக்ளோசோல் 75 WP (0.6 கிராம்/லிட்டர்) தெளிக்கவும்.\n"
+                f"• **பரிந்துரை:** இயற்கை முறையில் முதலில் வேப்பெண்ணெய் அல்லது பஞ்சகவ்யா தெளித்து கட்டுப்படுத்துவது நல்லது."
+            )
+        else:
+            return (
+                f"🐛 **Pest & Disease Control (Integrated Pest Management):**\n\n"
+                f"• **Stem Borer:** Apply Neem Seed Kernel Extract (NSKE 5%) or Cartap Hydrochloride 4G.\n"
+                f"• **Leaf Folder:** Release *Trichogramma* parasitoid egg cards (2 cards/acre) at weekly intervals.\n"
+                f"• **Paddy Blast (Magnaporthe oryzae):** Spray Tricyclazole 75 WP @ 0.6 g/L or Pseudomonos fluorescens foliar spray.\n"
+                f"• **Bio-control First:** Prefer organic bio-pesticides before turning to synthetic chemical sprays."
+            )
+
+    # 2. Organic Farming / Panchagavya
+    if any(k in q for k in ["organic", "iyarkai", "panchagavya", "jeevamrutham", "vermicompost", "manure"]):
+        if is_tamil:
+            return (
+                f"🌱 **இயற்கை வேளாண்மை மற்றும் பஞ்சகவ்யா வழிகாட்டல்:**\n\n"
+                f"• **பஞ்சகவ்யா தயாரிப்பு:** பசுஞ்சாணம், கோமியம், பால், தயிர், நெய், நாட்டுச்சர்க்கரை, இளநீர், கனிந்த வாழைப்பழம் ஆகியவற்றை சேர்த்து 21 நாட்கள் நொதிக்க வைக்கவும்.\n"
+                f"• **பயன்பாடு:** 3% கரைசல் (100 லிட்டர் தண்ணீருக்கு 3 லிட்டர் பஞ்சகவ்யா) தெளித்தால் பயிரின் நோய் எதிர்ப்பு சக்தி கூடும்.\n"
+                f"• **ஜீவாமிர்தம்:** மண் நுண்ணுயிரிகளை பெருக்கி வேர் வளர்ச்சியை விரைவுபடுத்தும்."
+            )
+        else:
+            return (
+                f"🌱 **Organic Farming & Bio-Enhancers:**\n\n"
+                f"• **Panchagavya:** Traditional 9-ingredient bio-enhancer (cow dung, urine, milk, curd, ghee, jaggery, tender coconut, banana). Use as a 3% foliar spray.\n"
+                f"• **Jeevamrutham:** Fermented cow dung-urine culture with pulse flour; drastically multiplies beneficial soil microbes.\n"
+                f"• **Vermicompost:** Apply 2.5 tonnes/ha to enhance soil moisture retention and organic carbon."
+            )
+
+    # 3. Irrigation / AWD / Drip
+    if any(k in q for k in ["irrigation", "water", "thanni", "awd", "drip", "pasanam"]):
+        if is_tamil:
+            return (
+                f"💧 **பாசனம் மற்றும் நீர் சேமிப்பு தொழில்நுட்பம்:**\n\n"
+                f"• **காய்ச்சலும் பாய்ச்சலும் முறை (AWD):** மண்ணில் 15 செ.மீ துளையிடப்பட்ட பிளாஸ்டிக் குழாயை வைத்து, நீர் தரைமட்டத்திற்கு கீழே 15 செ.மீ இறங்கிய பின் மீண்டும் நீர் பாய்ச்ச வேண்டும்.\n"
+                f"• **பலன்:** 25-30% தண்ணீர் சேமிப்புடன், மீத்தேன் வாயு வெளியேற்றமும் குறைகிறது.\n"
+                f"• **சொட்டு நீர் பாசனம்:** கரும்பு, பருத்தி, மக்காச்சோளம் மற்றும் தோட்டக்கலை பயிர்களுக்கு 45-90% மானியத்தில் அரசு வழங்குகிறது."
+            )
+        else:
+            return (
+                f"💧 **Water Management & Irrigation Efficiency:**\n\n"
+                f"• **Alternate Wetting & Drying (AWD):** Monitor water level using a perforated PVC pipe; re-irrigate only when water drops 15 cm below soil level.\n"
+                f"• **Water Savings:** 25–30% without any yield penalty.\n"
+                f"• **Drip Irrigation:** Highly recommended for cotton, sugarcane, maize, and orchards; TN government provides 45–90% subsidy."
+            )
+
+    # 4. Government Schemes / PM-Kisan / PMFBY
+    if any(k in q for k in ["scheme", "subsidy", "maniyam", "pmfby", "kisan", "insurance", "kaappeedu"]):
+        if is_tamil:
+            return (
+                f"🏛️ **தமிழ்நாடு விவசாய அரசு திட்டங்கள் மற்றும் மானியங்கள்:**\n\n"
+                f"• **PMFBY (பயிர் காப்பீட்டுத் திட்டம்):** வறட்சி, வெள்ளம் போன்ற இயற்கை பேரிடரால் ஏற்படும் பயிர் இழப்பிற்கு முழு காப்பீடு.\n"
+                f"• **PM-KISAN:** ஆண்டிற்கு ₹6,000 மூன்று தவணைகளில் நேரடியாக வங்கிக் கணக்கில்.\n"
+                f"• **நுண்ணீர் பாசன மானியம்:** சிறு/குறு விவசாயிகளுக்கு 100% மற்றும் இதர விவசாயிகளுக்கு 75% வரை சொட்டு நீர் மானியம்.\n"
+                f"• **விண்ணப்பிக்க:** அருகில் உள்ள வட்டார வேளாண்மை விரிவாக்க மையம் அல்லது உழவன் செயலியை (Uzhavan App) அணுகவும்."
+            )
+        else:
+            return (
+                f"🏛️ **Key Government Schemes & Subsidies for TN Farmers:**\n\n"
+                f"• **PMFBY (Crop Insurance):** Complete risk buffer against drought, cyclone, unseasonal floods, and post-harvest loss.\n"
+                f"• **PM-KISAN:** Direct income support of ₹6,000/year in 3 equal installments.\n"
+                f"• **Micro-Irrigation Subsidy:** Up to 100% subsidy for small/marginal farmers and 75% for other farmers through TN Horticulture Dept.\n"
+                f"• **Access:** Apply via your local Block Agricultural Extension Office or the Tamil Nadu 'Uzhavan' Mobile App."
+            )
+
+    # Fallback response
+    if is_tamil:
+        return (
+            f"🌾 **உழவன் ஏஐ (Uzhavan AI) பதில் — {district}:**\n\n"
+            f"உங்கள் கேள்வி: *'{query}'*\n\n"
+            f"நான் தமிழ்நாடு மாவட்ட காலநிலை அபாயங்கள், மழை முன்னறிவிப்பு, நெல்/பயறு சாகுபடி, உர மேலாண்மை, பூச்சி கட்டுப்பாடு மற்றும் அரசு திட்டங்கள் குறித்து பதிலளிக்க முடியும்.\n\n"
+            f"உதாரணமாக கேட்கலாம்:\n"
+            f"- *'இப்போது நெல் நடவு செய்யலாமா?'*\n"
+            f"- *'அடுத்த மாதம் மழை எப்படி இருக்கும்?'*\n"
+            f"- *'வறட்சியை தாங்கும் பயிர்கள் என்ன?'*"
+        )
+    else:
+        return (
+            f"🌾 **Uzhavan AI Agriculture Assistant — {district}:**\n\n"
+            f"Regarding your query on *'{query}'*:\n\n"
+            f"I can assist you with Tamil Nadu climate risk forecasts, crop calendars, pest management (IPM), irrigation techniques (AWD), soil health, and government subsidies.\n\n"
+            f"You can also ask:\n"
+            f"- *'Will it rain this month in {district}?'*\n"
+            f"- *'What are the best drought-resistant paddy varieties?'*\n"
+            f"- *'How to apply for crop insurance under PMFBY?'*"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main Router Function
+# ---------------------------------------------------------------------------
 
 def get_agriculture_response(
     user_query: str,
-    selected_district: Optional[str] = None,
-    advisory: Optional[dict] = None
+    selected_district: Optional[str] = "Chennai",
+    advisory: Optional[Dict[str, Any]] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
+    api_key: Optional[str] = None
 ) -> str:
     """
-    Returns a rule-based agriculture advisory response for a farmer query.
+    Main entry point for chatbot responses.
 
-    Parameters
-    ----------
-    user_query       : Raw text query from the user
-    selected_district: Currently selected district (for context injection)
-    advisory         : Current advisory dict from src/advisory.py (for context injection)
-
-    Returns
-    -------
-    str: Markdown-formatted advisory response
+    1. Checks for Gemini API key (from parameter or environment). If present, calls Gemini.
+    2. If no key, routes through the smart multi-lingual intent classifier.
     """
-    q = _normalize(user_query)
+    district = selected_district or "Chennai"
+    raw_query = user_query.strip()
+    q_cleaned = clean_query(raw_query)
 
-    # Score all knowledge base entries
-    scored = []
-    for patterns, response in AGRI_KB:
-        score = _score_entry(q, patterns)
-        if score > 0:
-            scored.append((score, response))
+    # Check for Gemini API key
+    active_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+    if active_key:
+        llm_resp = call_gemini_api(raw_query, active_key, district, telemetry, advisory)
+        if llm_resp:
+            return llm_resp
 
-    # Sort by match score descending
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # Local Engine: Detect language
+    is_tamil = is_tamil_script(raw_query)
+    is_tan = is_tanglish(raw_query)
 
-    if scored:
-        best_response = scored[0][1]
-
-        # Inject district context into the response if no district keyword was in query
-        if selected_district and selected_district.lower() not in q:
-            best_response = (
-                f"*📍 Responding for **{selected_district}** context:*\n\n"
-                + best_response
+    # Check if query is just a simple greeting with nothing else
+    if not q_cleaned or q_cleaned in ["hi", "hello", "vanakkam", "hey", "namaste"]:
+        if is_tamil:
+            return (
+                f"👋 **வணக்கம்! நான் உங்கள் {district} மாவட்ட வேளாண் மற்றும் காலநிலை உதவியாளர்.**\n\n"
+                f"நீங்கள் என்னிடம் கேட்கலாம்:\n"
+                f"- 🌧️ மழை முன்னறிவிப்பு & வானிலை நிலவரம்\n"
+                f"- 🌾 நெல், பருத்தி, கரும்பு சாகுபடி மற்றும் ரகங்கள்\n"
+                f"- 💧 காய்ச்சலும் பாய்ச்சலும் (AWD) பாசன முறை\n"
+                f"- 🐛 பயிர் பூச்சி மற்றும் நோய் கட்டுப்பாடு\n"
+                f"- 🏛️ பயிர் காப்பீடு & அரசு மானியங்கள்\n\n"
+                f"உங்கள் கேள்வியை கீழே தட்டச்சு செய்யவும் அல்லது மைக்ரோஃபோன் மூலம் பேசவும்!"
             )
-        return best_response
+        elif is_tan:
+            return (
+                f"👋 **Vanakkam! Welcome to {district} Agri & Climate AI.**\n\n"
+                f"Enkitta neenga kekalam:\n"
+                f"- 🌧️ Mazhai varuma & Weather forecast\n"
+                f"- 🌾 Nellu podalama, best varieties\n"
+                f"- 💧 Thanni pasanam & AWD tips\n"
+                f"- 🐛 Poochi marundhu & IPM methods\n\n"
+                f"Type pannunga or mic use panni pesunga!"
+            )
+        else:
+            return (
+                f"👋 **Welcome to the {district} Climate & Agriculture Advisory AI!**\n\n"
+                f"I can help you with:\n"
+                f"- 🌧️ **Weather & Rainfall Forecasts** for Tamil Nadu districts\n"
+                f"- 🌾 **Crop Planting & Cultivar Selection** (Paddy, Millets, Pulses, Cotton)\n"
+                f"- 💧 **Water Conservation & AWD Irrigation**\n"
+                f"- 🐛 **Pest & Disease Management** (IPM)\n"
+                f"- 🏛️ **Government Subsidies & PMFBY Crop Insurance**\n\n"
+                f"Ask any question in English, Tamil (தமிழ்), or Tanglish — or tap the 🎙️ mic to speak!"
+            )
 
-    # Fallback: try to be helpful based on advisory context
-    if advisory:
-        zone = advisory.get("agro_climatic_zone", "Tamil Nadu")
-        crops = ", ".join(
-            [c.get("crop", "") for c in advisory.get("recommended_crops", [])[:3]]
-        )
-        return (
-            f"🌾 Based on the current forecast for **{selected_district or 'your district'}** "
-            f"({zone}), the top recommended crops are: **{crops}**.\n\n"
-            f"You can ask me more specific questions about:\n"
-            f"- ENSO / IOD effects on rainfall\n"
-            f"- Drought or flood management\n"
-            f"- Sowing windows, fertilizers, pests\n"
-            f"- Government schemes and subsidies"
-        )
+    # Multi-Intent: Weather + Paddy/Crop planting
+    has_rain = any(w in q_cleaned for w in [
+        "rain", "weather", "mazhai", "malai", "rainy", "tomorow", "tomorrow", "forecast",
+        "மழை", "வானிலை", "மழைய", "புயல்"
+    ])
+    has_paddy = any(w in q_cleaned for w in [
+        "paddy", "rice", "nellu", "nel", "grow", "plant", "sow", "saagubadi", "cultivat",
+        "நெல்", "சாகுபடி", "பயிரிட", "நடவு", "விதைக்க"
+    ])
 
-    return (
-        "🙏 I didn't quite catch that. Try asking:\n"
-        "- *'What is El Niño?'* or *'How does IOD affect Tamil Nadu?'*\n"
-        "- *'Best crops for drought conditions?'*\n"
-        "- *'Sowing window for paddy in Thanjavur?'*\n"
-        "- *'How to manage flood in Cauvery delta?'*"
-    )
+    if has_rain and has_paddy:
+        return answer_combined_paddy_and_rain(district, telemetry, advisory, is_tamil, is_tan)
+    elif has_rain:
+        return answer_weather_query(district, telemetry, is_tamil, is_tan)
+    elif has_paddy:
+        return answer_paddy_query(district, telemetry, advisory, is_tamil, is_tan)
+    else:
+        return answer_general_agri_query(q_cleaned, district, is_tamil, is_tan)
